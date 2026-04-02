@@ -288,7 +288,8 @@ L’anonymisation réduit l’exposition des données au modèle, mais ne rempla
 ## Tests :
 
 Pour tester :
-```bashpytest -q test_anonymizer.py --cache-clear
+```bash
+pytest -q test_anonymizer.py --cache-clear
 ```
 ---
 
