@@ -285,6 +285,13 @@ L’anonymisation réduit l’exposition des données au modèle, mais ne rempla
 
 ---
 
+## Tests :
+
+Pour tester :
+```bashpytest -q test_anonymizer.py --cache-clear
+```
+---
+
 ## Remarque :
 
 Une IA de codage a été utilisée pour assister la conception de cet outil, notamment pour :
