@@ -1,10 +1,10 @@
 """
 title: Anonymizer-Axiorhub
-author: OpenAI
-version: 2.0.0
+author: Timo
+version: 2.2.1
 license: MIT
 description: Outil Open WebUI pour anonymiser/désanonymiser les prompts avec mapping persistant SQLite,
-             recognizers FR custom (NIR, SIRET, SIREN, RCS, EMAIL, IBAN, PHONE_FR) et fallback robuste.
+             séparation nette entre détection structurée et détection des personnes.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from pathlib import Path
 from threading import RLock
 from typing import Dict, List, Optional, Tuple
 import json
-import os
 import sqlite3
 import time
 import uuid
@@ -28,47 +27,62 @@ try:
         Pattern,
         PatternRecognizer,
         RecognizerRegistry,
-        RecognizerResult,
     )
 except Exception:  # pragma: no cover
     AnalyzerEngine = None  # type: ignore[assignment]
     Pattern = None  # type: ignore[assignment]
     PatternRecognizer = None  # type: ignore[assignment]
     RecognizerRegistry = None  # type: ignore[assignment]
-    RecognizerResult = None  # type: ignore[assignment]
 
 
 TOKEN_RE = re.compile(r"\[(?:PERSON_\d+_)?[A-Z_]+_\d+\]")
 
+STRUCTURED_TYPES = {
+    "EMAIL_CUSTOM",
+    "IBAN_CUSTOM",
+    "PHONE_FR",
+    "PHONE_NUMBER",
+    "NIR",
+    "SIRET",
+    "SIREN",
+    "RCS",
+}
+
+PERSON_TYPES = {
+    "PERSON_FR",
+    "PERSON",
+}
+
+ENTITY_PRIORITY = {
+    "NIR": 100,
+    "IBAN_CUSTOM": 95,
+    "EMAIL_CUSTOM": 95,
+    "PHONE_FR": 90,
+    "PHONE_NUMBER": 90,
+    "SIRET": 90,
+    "SIREN": 90,
+    "RCS": 90,
+    "PERSON_FR": 60,
+    "PERSON": 50,
+    "LOCATION": 40,
+    "DATE_TIME": 40,
+}
+
 
 class Valves(BaseModel):
-    sqlite_path: str = Field(
-        default="/data/pii_map.sqlite",
-        description="Chemin SQLite persistant.",
-    )
-    mapping_ttl_hours: int = Field(
-        default=24,
-        ge=1,
-        le=720,
-        description="TTL des mappings en heures.",
-    )
-    score_threshold: float = Field(
-        default=0.35,
-        ge=0.0,
-        le=1.0,
-        description="Seuil de détection Presidio.",
-    )
-    enable_persistence: bool = Field(
-        default=True,
-        description="Persister les mappings en SQLite.",
-    )
+    sqlite_path: str = Field(default="/data/pii_map.sqlite")
+    mapping_ttl_hours: int = Field(default=24, ge=1, le=720)
+    score_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+
+    enable_persistence: bool = Field(default=True)
     persist_original_text: bool = Field(
         default=False,
         description="Stocker le texte original. Désactivé par défaut pour limiter l'exposition.",
     )
 
-    # Recognizers FR custom
     enable_person_fr: bool = True
+    enable_person: bool = False
+
     enable_siret: bool = True
     enable_siren: bool = True
     enable_rcs: bool = True
@@ -76,23 +90,13 @@ class Valves(BaseModel):
     enable_email: bool = True
     enable_iban: bool = True
     enable_phone_fr: bool = True
-
-    # Entités Presidio génériques. Désactivées par défaut car souvent peu fiables sans modèle NLP configuré.
-    enable_person: bool = False
-    enable_location: bool = False
-    enable_datetime: bool = False
     enable_phone: bool = False
 
-    person_window_chars: int = Field(
-        default=120,
-        ge=20,
-        le=1000,
-        description="Fenêtre de rattachement des PII à une personne.",
-    )
-    presidio_language: str = Field(
-        default="en",
-        description="Langue Presidio. 'en' tant que les recognizers custom sont définis pour cette langue.",
-    )
+    enable_location: bool = False
+    enable_datetime: bool = False
+
+    person_window_chars: int = Field(default=120, ge=20, le=1000)
+    presidio_language: str = Field(default="en")
 
 
 @dataclass
@@ -114,26 +118,21 @@ class ClusteredEntity:
 
 
 class Tools:
-    def __init__(self) -> None:
-        self.valves = Valves()
+    def __init__(self, valves: Optional[Valves] = None) -> None:
+        self.valves = valves or Valves()
         self._db_lock = RLock()
-        self._regex_recognizers = self._build_regex_recognizers()
+        self._structured_regex = self._build_structured_regex_recognizers()
+        self._person_regex = self._build_person_regex_recognizers()
         self.registry = None
         self.analyzer = None
         self._setup_presidio()
         self._init_db()
 
     # -------------------------
-    # API Open WebUI publique
+    # API Open WebUI
     # -------------------------
 
     async def anonymize_prompt(self, text: str) -> str:
-        """Anonymise le texte et ajoute un MAPPING_ID si la persistance est activée.
-
-        Cette méthode est pratique pour un usage manuel depuis Open WebUI.
-        Pour un proxy, préfère `anonymize_text_with_mapping` pour éviter d'injecter
-        le mapping ID dans le prompt envoyé au modèle.
-        """
         anonymized_text, mapping_id = self.anonymize_text_with_mapping(text)
         if mapping_id:
             return f"{anonymized_text}\n\n[MAPPING_ID={mapping_id}]"
@@ -145,7 +144,7 @@ class Tools:
         return self.deanonymize_text(text, mapping_id)
 
     # -------------------------
-    # API interne utile au proxy
+    # API proxy / interne
     # -------------------------
 
     def anonymize_text_with_mapping(self, text: str) -> Tuple[str, Optional[str]]:
@@ -185,6 +184,7 @@ class Tools:
     def supported_entities(self) -> List[str]:
         return [
             "PERSON_FR",
+            "PERSON",
             "SIRET",
             "SIREN",
             "RCS",
@@ -192,40 +192,23 @@ class Tools:
             "EMAIL_CUSTOM",
             "IBAN_CUSTOM",
             "PHONE_FR",
-            "PERSON",
+            "PHONE_NUMBER",
             "LOCATION",
             "DATE_TIME",
-            "PHONE_NUMBER",
         ]
 
     # -------------------------
-    # Détection / anonymisation
+    # Détection
     # -------------------------
 
-    def _build_regex_recognizers(self) -> Dict[str, List[Tuple[re.Pattern, float]]]:
+    def _build_structured_regex_recognizers(self) -> Dict[str, List[Tuple[re.Pattern, float]]]:
         return {
-            "PERSON_FR": [
-                (
-                    re.compile(
-                        r"\b([A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ][a-zà-ÿ'’\-]+(?:\s+[A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ][a-zà-ÿ'’\-]+){1,3})\b"
-                    ),
-                    0.72,
-                ),
-                (
-                    re.compile(
-                        r"\b([A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ]{2,}(?:\s+[A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ]{2,}){1,3})\b"
-                    ),
-                    0.55,
-                ),
-            ],
             "SIRET": [(re.compile(r"\b\d{14}\b"), 0.95)],
             "SIREN": [(re.compile(r"\b\d{9}\b"), 0.92)],
             "RCS": [
                 (
-                    re.compile(
-                        r"\bRCS\s+[A-ZÀ-ÿ][A-Za-zÀ-ÿ'’\- ]+\s+\d{3}\s+\d{3}\s+\d{3}\b"
-                    ),
-                    0.80,
+                    re.compile(r"\bRCS\s+[A-ZÀ-ÿ][A-Za-zÀ-ÿ'’\- ]+\s+\d{3}\s+\d{3}\s+\d{3}\b"),
+                    0.85,
                 )
             ],
             "NIR": [
@@ -237,19 +220,31 @@ class Tools:
             "EMAIL_CUSTOM": [
                 (
                     re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
-                    0.90,
+                    0.99,
                 )
             ],
             "IBAN_CUSTOM": [
                 (
                     re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b"),
-                    0.90,
+                    0.98,
                 )
             ],
             "PHONE_FR": [
                 (re.compile(r"\b0[1-9](?:[ .-]?\d{2}){4}\b"), 0.90),
                 (re.compile(r"\+33[ .-]?[1-9](?:[ .-]?\d{2}){4}\b"), 0.90),
             ],
+        }
+
+    def _build_person_regex_recognizers(self) -> Dict[str, List[Tuple[re.Pattern, float]]]:
+        return {
+            "PERSON_FR": [
+                (
+                    re.compile(
+                        r"\b([A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ][a-zà-ÿ'’\-]{1,30}\s+[A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ][a-zà-ÿ'’\-]{1,30})\b"
+                    ),
+                    0.78,
+                ),
+            ]
         }
 
     def _setup_presidio(self) -> None:
@@ -269,33 +264,12 @@ class Tools:
                 )
             )
 
-        add(
-            "PERSON_FR",
-            [
-                (
-                    "French full name",
-                    r"\b([A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ][a-zà-ÿ'’\-]+(?:\s+[A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ][a-zà-ÿ'’\-]+){1,3})\b",
-                    0.72,
-                ),
-                (
-                    "French uppercase name",
-                    r"\b([A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ]{2,}(?:\s+[A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ]{2,}){1,3})\b",
-                    0.55,
-                ),
-            ],
-        )
         add("SIRET", [("SIRET", r"\b\d{14}\b", 0.95)])
         add("SIREN", [("SIREN", r"\b\d{9}\b", 0.92)])
-        add(
-            "RCS",
-            [("RCS", r"\bRCS\s+[A-ZÀ-ÿ][A-Za-zÀ-ÿ'’\- ]+\s+\d{3}\s+\d{3}\s+\d{3}\b", 0.80)],
-        )
+        add("RCS", [("RCS", r"\bRCS\s+[A-ZÀ-ÿ][A-Za-zÀ-ÿ'’\- ]+\s+\d{3}\s+\d{3}\s+\d{3}\b", 0.85)])
         add("NIR", [("NIR", r"\b[12]\s?\d{2}\s?\d{2}\s?\d{2}\s?\d{3}\s?\d{3}\s?\d{2}\b", 0.95)])
-        add(
-            "EMAIL_CUSTOM",
-            [("Email simple", r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", 0.90)],
-        )
-        add("IBAN_CUSTOM", [("IBAN generic", r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b", 0.90)])
+        add("EMAIL_CUSTOM", [("Email simple", r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", 0.99)])
+        add("IBAN_CUSTOM", [("IBAN generic", r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b", 0.98)])
         add(
             "PHONE_FR",
             [
@@ -303,15 +277,23 @@ class Tools:
                 ("Phone FR international", r"\+33[ .-]?[1-9](?:[ .-]?\d{2}){4}\b", 0.90),
             ],
         )
+        add(
+            "PERSON_FR",
+            [
+                (
+                    "French full name strict",
+                    r"\b([A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ][a-zà-ÿ'’\-]{1,30}\s+[A-ZÉÈÀÂÊÎÔÛÄËÏÖÜÇ][a-zà-ÿ'’\-]{1,30})\b",
+                    0.78,
+                ),
+            ],
+        )
 
         self.registry = registry
         self.analyzer = AnalyzerEngine(registry=registry)
 
-    def _enabled_entities(self) -> List[str]:
+    def _enabled_structured_entities(self) -> List[str]:
         v = self.valves
         entities: List[str] = []
-        if v.enable_person_fr:
-            entities.append("PERSON_FR")
         if v.enable_siret:
             entities.append("SIRET")
         if v.enable_siren:
@@ -326,38 +308,53 @@ class Tools:
             entities.append("IBAN_CUSTOM")
         if v.enable_phone_fr:
             entities.append("PHONE_FR")
-        if v.enable_person:
-            entities.append("PERSON")
-        if v.enable_location:
-            entities.append("LOCATION")
-        if v.enable_datetime:
-            entities.append("DATE_TIME")
         if v.enable_phone:
             entities.append("PHONE_NUMBER")
         return entities
 
+    def _enabled_person_entities(self) -> List[str]:
+        v = self.valves
+        entities: List[str] = []
+        if v.enable_person_fr:
+            entities.append("PERSON_FR")
+        if v.enable_person:
+            entities.append("PERSON")
+        return entities
+
+    def _enabled_generic_entities(self) -> List[str]:
+        v = self.valves
+        entities: List[str] = []
+        if v.enable_location:
+            entities.append("LOCATION")
+        if v.enable_datetime:
+            entities.append("DATE_TIME")
+        return entities
+
     def _analyze(self, text: str) -> List[SimpleResult]:
-        entities = self._enabled_entities()
-        if not entities or not text:
+        if not text:
             return []
 
+        structured = self._detect_structured_entities(text)
+        occupied = [(r.start, r.end) for r in structured]
+
+        persons = self._detect_person_entities(text, occupied)
+        occupied.extend((r.start, r.end) for r in persons)
+
+        generic = self._detect_generic_entities(text, occupied)
+
+        results = structured + persons + generic
+        return self._dedupe_and_select_best(results)
+
+    def _detect_structured_entities(self, text: str) -> List[SimpleResult]:
+        entities = self._enabled_structured_entities()
         results: List[SimpleResult] = []
 
-        # 1) Recognizers regex locaux, toujours dispo
         for entity_type in entities:
-            for pattern, score in self._regex_recognizers.get(entity_type, []):
+            for pattern, score in self._structured_regex.get(entity_type, []):
                 for match in pattern.finditer(text):
-                    results.append(
-                        SimpleResult(
-                            entity_type=entity_type,
-                            start=match.start(),
-                            end=match.end(),
-                            score=score,
-                        )
-                    )
+                    results.append(SimpleResult(entity_type, match.start(), match.end(), score))
 
-        # 2) Presidio en complément si dispo
-        if self.analyzer is not None:
+        if self.analyzer is not None and entities:
             try:
                 presidio_results = self.analyzer.analyze(
                     text=text,
@@ -366,26 +363,83 @@ class Tools:
                     score_threshold=self.valves.score_threshold,
                 )
                 for item in presidio_results:
-                    results.append(
-                        SimpleResult(
-                            entity_type=item.entity_type,
-                            start=item.start,
-                            end=item.end,
-                            score=float(item.score),
-                        )
-                    )
+                    results.append(SimpleResult(item.entity_type, item.start, item.end, float(item.score)))
             except Exception:
                 pass
 
-        return self._merge_overlapping_results(results)
+        return self._dedupe_and_select_best(results)
+
+    def _detect_person_entities(self, text: str, occupied_ranges: List[Tuple[int, int]]) -> List[SimpleResult]:
+        entities = self._enabled_person_entities()
+        results: List[SimpleResult] = []
+
+        for entity_type in entities:
+            for pattern, score in self._person_regex.get(entity_type, []):
+                for match in pattern.finditer(text):
+                    start, end = match.start(), match.end()
+                    if self._overlaps_any(start, end, occupied_ranges):
+                        continue
+                    results.append(SimpleResult(entity_type, start, end, score))
+
+        return self._dedupe_and_select_best(results)
+
+    def _detect_generic_entities(self, text: str, occupied_ranges: List[Tuple[int, int]]) -> List[SimpleResult]:
+        entities = self._enabled_generic_entities()
+        results: List[SimpleResult] = []
+
+        if self.analyzer is not None and entities:
+            try:
+                presidio_results = self.analyzer.analyze(
+                    text=text,
+                    language=self.valves.presidio_language,
+                    entities=entities,
+                    score_threshold=self.valves.score_threshold,
+                )
+                for item in presidio_results:
+                    if self._overlaps_any(item.start, item.end, occupied_ranges):
+                        continue
+                    results.append(SimpleResult(item.entity_type, item.start, item.end, float(item.score)))
+            except Exception:
+                pass
+
+        return self._dedupe_and_select_best(results)
+
+    def _dedupe_and_select_best(self, results: List[SimpleResult]) -> List[SimpleResult]:
+        if not results:
+            return []
+
+        ordered = sorted(
+            results,
+            key=lambda item: (
+                ENTITY_PRIORITY.get(item.entity_type, 0),
+                item.score,
+                item.end - item.start,
+            ),
+            reverse=True,
+        )
+
+        selected: List[SimpleResult] = []
+        for item in ordered:
+            if not any(self._ranges_overlap(item.start, item.end, kept.start, kept.end) for kept in selected):
+                selected.append(item)
+
+        selected.sort(key=lambda item: (item.start, item.end))
+        return selected
+
+    def _ranges_overlap(self, a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+        return not (a_end <= b_start or a_start >= b_end)
+
+    def _overlaps_any(self, start: int, end: int, ranges: List[Tuple[int, int]]) -> bool:
+        return any(self._ranges_overlap(start, end, r_start, r_end) for r_start, r_end in ranges)
 
     def _cluster_entities(self, text: str, results: List[SimpleResult]) -> List[ClusteredEntity]:
         window = self.valves.person_window_chars
-        anchors = [r for r in results if r.entity_type in ("PERSON", "PERSON_FR")]
-        others = [r for r in results if r.entity_type not in ("PERSON", "PERSON_FR")]
+        anchors = [r for r in results if r.entity_type in PERSON_TYPES]
+        others = [r for r in results if r.entity_type not in PERSON_TYPES]
         anchors.sort(key=lambda item: item.start)
 
         clustered: List[ClusteredEntity] = []
+
         for idx, anchor in enumerate(anchors, start=1):
             clustered.append(
                 ClusteredEntity(
@@ -400,13 +454,29 @@ class Tools:
 
         for item in others:
             best_person_id: Optional[int] = None
-            best_dist: Optional[int] = None
-            for idx, anchor in enumerate(anchors, start=1):
-                dist = max(0, max(anchor.start, item.start) - min(anchor.end, item.end))
-                if best_dist is None or dist < best_dist:
-                    best_dist = dist
+
+            previous_anchors = [
+                (idx, anchor)
+                for idx, anchor in enumerate(anchors, start=1)
+                if anchor.end <= item.start
+            ]
+            next_anchors = [
+                (idx, anchor)
+                for idx, anchor in enumerate(anchors, start=1)
+                if anchor.start >= item.end
+            ]
+
+            if previous_anchors:
+                idx, anchor = previous_anchors[-1]
+                dist = item.start - anchor.end
+                if dist <= window:
                     best_person_id = idx
-            person_id = best_person_id if best_dist is not None and best_dist <= window else None
+            elif next_anchors:
+                idx, anchor = next_anchors[0]
+                dist = anchor.start - item.end
+                if dist <= window:
+                    best_person_id = idx
+
             clustered.append(
                 ClusteredEntity(
                     entity_type=item.entity_type,
@@ -414,7 +484,7 @@ class Tools:
                     end=item.end,
                     score=item.score,
                     text=text[item.start:item.end],
-                    person_id=person_id,
+                    person_id=best_person_id,
                 )
             )
 
@@ -443,6 +513,7 @@ class Tools:
                 result_parts.append(text[last_idx:entity.start])
 
             subtype = self._normalize_subtype(entity.entity_type)
+
             if entity.person_id is not None:
                 person_type_counters.setdefault(entity.person_id, {})
                 person_type_counters[entity.person_id].setdefault(subtype, 0)
@@ -465,7 +536,7 @@ class Tools:
         return "".join(result_parts), mapping
 
     def _normalize_subtype(self, entity_type: str) -> str:
-        if entity_type in {"PERSON", "PERSON_FR"}:
+        if entity_type in PERSON_TYPES:
             return "NAME"
         if entity_type == "EMAIL_CUSTOM":
             return "EMAIL"
@@ -478,12 +549,13 @@ class Tools:
         return entity_type
 
     # -------------------------
-    # Persistence SQLite
+    # SQLite
     # -------------------------
 
     def _init_db(self) -> None:
         db_path = Path(self.valves.sqlite_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
+
         with self._db_lock, sqlite3.connect(db_path) as conn:
             conn.execute(
                 """
@@ -498,10 +570,25 @@ class Tools:
             )
             conn.commit()
 
+    def _original_text_column_requires_value(self) -> bool:
+        with self._db_lock, sqlite3.connect(self.valves.sqlite_path) as conn:
+            rows = conn.execute("PRAGMA table_info(mappings)").fetchall()
+
+        for row in rows:
+            if row[1] == "original_text":
+                return bool(row[3])
+        return False
+
     def _store_mapping(self, original_text: str, anonymized_text: str, mapping: Dict[str, str]) -> str:
         mapping_id = str(uuid.uuid4())
         now = int(time.time())
-        original_to_store = original_text if self.valves.persist_original_text else None
+
+        if self.valves.persist_original_text:
+            original_to_store = original_text
+        else:
+            original_to_store = None
+            if self._original_text_column_requires_value():
+                original_to_store = ""
 
         with self._db_lock, sqlite3.connect(self.valves.sqlite_path) as conn:
             conn.execute(
@@ -531,23 +618,5 @@ class Tools:
                 "SELECT mapping_json FROM mappings WHERE mapping_id = ?",
                 (mapping_id,),
             ).fetchone()
+
         return json.loads(row[0]) if row else {}
-
-    # -------------------------
-    # Utilitaires
-    # -------------------------
-
-    def _merge_overlapping_results(self, results: List[SimpleResult]) -> List[SimpleResult]:
-        if not results:
-            return []
-
-        ordered = sorted(
-            results,
-            key=lambda item: (item.start, -(item.end - item.start), -item.score),
-        )
-        merged: List[SimpleResult] = []
-        for item in ordered:
-            if merged and item.start < merged[-1].end:
-                continue
-            merged.append(item)
-        return merged
