@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from anonymizer_axiorhub_fixed import Tools
+from anonymizer_axiorhub import Tools
 
 
 logger = logging.getLogger("anonymizer_proxy")
